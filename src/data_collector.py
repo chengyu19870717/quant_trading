@@ -6,6 +6,7 @@ import warnings
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
@@ -46,25 +47,90 @@ def _get_db():
 class StockDataCollector:
 
     def get_stock_data(self, code: str, date: str) -> dict:
-        """获取股票行情 + 财务 + 估值，带本地缓存"""
-        conn = _get_db()
-        row = conn.execute(
-            "SELECT data_json FROM daily_cache WHERE code=? AND trade_date=?",
-            (code, date)
-        ).fetchone()
+        """获取股票行情 + 财务 + 估值
+        优先级：实时快照 → 最新日线（强制拉取）→ 本地缓存
+        """
+        # 1) 尝试实时行情（盘中有效）
+        realtime = self._fetch_realtime(code)
+        if realtime:
+            hist = self._ensure_hist(code)
+            if hist is not None and not hist.empty:
+                realtime["hist"] = hist
+                return realtime
 
-        if row:
-            import json
-            data = json.loads(row[0])
-            # hist 存的是 records 格式，恢复为 DataFrame
-            data["hist"] = pd.DataFrame(data["hist"])
-            conn.close()
-            return data
-
+        # 2) 强制从 akshare 拉取最新日线（保证用最新收盘价）
         data = self._fetch_from_akshare(code, date)
+
+        # 3) 写入本地缓存
+        conn = _get_db()
         self._save_cache(conn, code, date, data)
         conn.close()
         return data
+
+    # ── 实时行情 ──────────────────────────────────────────
+
+    def _fetch_realtime(self, code: str) -> Optional[dict]:
+        """东方财富实时/盘中快照，返回与日线同构的数据 dict。
+        失败返回 None，调用方自行回落。
+        """
+        import akshare as ak
+        try:
+            df = ak.stock_zh_a_spot_em()
+            if df is None or df.empty:
+                return None
+            row = df[df["代码"] == code]
+            if row.empty:
+                return None
+            r = row.iloc[0]
+
+            price      = float(r.get("最新价") or 0)
+            prev_close = float(r.get("昨收") or 0)
+            if price <= 0 or prev_close <= 0:
+                return None
+
+            change_pct = (price - prev_close) / prev_close * 100
+            float_shares = float(r.get("流通市值") or 0) / price if price else 0
+
+            return {
+                "code":               code,
+                "name":               str(r.get("名称", code)),
+                "trade_date":         str(r.get("时间", datetime.now().strftime("%Y-%m-%d")))[:10],
+                "price":              price,
+                "change_pct":         round(change_pct, 2),
+                "change_amt":         round(price - prev_close, 4),
+                "open":               float(r.get("今开") or 0),
+                "high":               float(r.get("最高") or price),
+                "low":                float(r.get("最低") or price),
+                "volume":             float(r.get("成交量") or 0),
+                "turnover":           float(r.get("成交额") or 0),
+                "turnover_rate":      float(r.get("换手率") or 0),
+                "amplitude":          float(r.get("振幅") or 0),
+                "vol_avg20":          0,  # 实时接口无此字段，由 hist 计算
+                "float_mv":           float(r.get("流通市值") or 0),
+                "circulation_market_cap": float(r.get("流通市值") or 0) / 1e8,
+                "pe":                 float(r.get("市盈率-动态") or 0),
+                "pb":                 0,
+                "main_net_flow":      0,
+                # 以下字段 hist 补充后再写入
+                "hist":               None,
+            }
+        except Exception:
+            return None
+
+    def _ensure_hist(self, code: str) -> Optional[pd.DataFrame]:
+        """拉取近 60 交易日日线，供指标计算使用"""
+        import akshare as ak
+        try:
+            hist_raw = ak.stock_zh_a_daily(symbol=_sina_symbol(code), adjust="qfq")
+            if hist_raw is None or hist_raw.empty:
+                return None
+            return hist_raw.rename(columns={
+                "date": "日期", "open": "开盘", "high": "最高",
+                "low": "最低", "close": "收盘", "volume": "成交量",
+                "outstanding_share": "流通股", "turnover": "换手率",
+            }).tail(60).reset_index(drop=True)
+        except Exception:
+            return None
 
     def _fetch_from_akshare(self, code: str, date: str) -> dict:
         import akshare as ak
