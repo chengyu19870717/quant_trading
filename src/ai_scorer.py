@@ -45,16 +45,24 @@ class AIStockScorer:
 
         for sig in signals:
             if sig in bullish:
-                score += 8
+                score += 12  # 从 8 提升到 12，增加信号区分度
             elif sig in bearish:
-                score -= 8
+                score -= 12
 
         # 偏离 MA20 过远扣分
         dist = abs(data.get("distance_from_ma20", 0))
         if dist > 10:
-            score -= 10
+            score -= 15
         elif dist > 5:
-            score -= 5
+            score -= 8
+
+        # 多信号共振额外加分/减分
+        bullish_count = sum(1 for s in signals if s in bullish)
+        bearish_count = sum(1 for s in signals if s in bearish)
+        if bullish_count >= 2:
+            score += 10
+        elif bearish_count >= 2:
+            score -= 10
 
         return max(0.0, min(100.0, score))
 
@@ -111,16 +119,17 @@ class AIStockScorer:
         else:
             flow_ratio = 0
 
+        # 扩大资金流区分度
         if flow_ratio > 5:
-            score += 25
+            score += 30
         elif flow_ratio > 3:
-            score += 15
+            score += 20
         elif flow_ratio > 1:
-            score += 5
+            score += 10
         elif flow_ratio < -3:
-            score -= 20
+            score -= 25
         elif flow_ratio < -1:
-            score -= 10
+            score -= 15
 
         return max(0.0, min(100.0, score))
 
@@ -144,6 +153,13 @@ class AIStockScorer:
         elif vol_ratio < 0.5:
             score -= 10
 
+        # 涨跌幅动量
+        change_pct = abs(data.get("change_pct", 0))
+        if change_pct > 5:
+            score += 10 if data.get("change_pct", 0) > 0 else -10
+        elif change_pct > 3:
+            score += 5 if data.get("change_pct", 0) > 0 else -5
+
         return max(0.0, min(100.0, score))
 
     @staticmethod
@@ -158,6 +174,7 @@ class AIStockScorer:
 
         辅助微调：
           获利比例越低（筹码越套），在其他条件成立时额外加分
+          筹码宽度越窄，额外加分
         """
         score = 50
         chip_signals = data.get("chip_signals", [])
@@ -172,6 +189,11 @@ class AIStockScorer:
         # 获利比例极低（<10%）时额外+5，说明筹码大量套牢
         profit = data.get("chip_profit_ratio", 50)
         if chip_signals and profit < 10:
+            score += 5
+
+        # 筹码宽度极窄时额外加分
+        width = data.get("chip_width_70", 50)
+        if width > 0 and width < 5:
             score += 5
 
         return max(0.0, min(100.0, score))

@@ -13,9 +13,14 @@ class DailyReportGenerator:
     def __init__(self, date: str):
         self.date   = date
         self.stocks = []
+        self.yesterday_verify = None  # 昨日预测验证数据
 
     def add_stock(self, stock_data: dict):
         self.stocks.append(stock_data)
+
+    def set_yesterday_verify(self, verify_data: list):
+        """设置昨日预测验证数据: [{name, code, pred_prob, actual_change}]"""
+        self.yesterday_verify = verify_data
 
     def generate_markdown(self) -> str:
         sorted_stocks = sorted(self.stocks, key=lambda x: x.get("probability", 0), reverse=True)
@@ -26,7 +31,12 @@ class DailyReportGenerator:
 **生成时间**: {datetime.now().strftime('%H:%M:%S')}
 **监控标的**: {len(self.stocks)} 只
 
----
+"""
+        # 昨日预测验证
+        if self.yesterday_verify:
+            report += self._generate_verify_section()
+
+        report += """---
 
 ## 重点股票分析
 
@@ -36,6 +46,32 @@ class DailyReportGenerator:
 
         report += self._generate_summary(sorted_stocks)
         return report
+
+    def _generate_verify_section(self) -> str:
+        """生成昨日预测验证区块"""
+        lines = ["## 📈 昨日预测验证\n"]
+        lines.append("| 股票 | 昨日预测上涨概率 | 今日实际涨跌 | 预测结果 |")
+        lines.append("|---|---|---|---|")
+
+        correct = 0
+        total = 0
+        for v in self.yesterday_verify:
+            pred = v.get("pred_prob", 50)
+            actual = v.get("actual_change", 0)
+            pred_up = pred >= 50
+            actual_up = actual >= 0
+            hit = pred_up == actual_up
+            if hit:
+                correct += 1
+            total += 1
+            emoji = "✅" if hit else "❌"
+            direction = "▲" if actual_up else "▼"
+            lines.append(f"| {v.get('name', '')}({v.get('code', '')}) | {pred:.1f}% | {direction}{abs(actual):.2f}% | {emoji} |")
+
+        acc = correct / total * 100 if total else 0
+        lines.append(f"\n> **近期预测准确率**: {acc:.0f}% ({correct}/{total})")
+        lines.append("")
+        return "\n".join(lines)
 
     def _format_stock(self, s: dict, rank: int) -> str:
         prob  = s.get("probability", 50)
@@ -161,4 +197,15 @@ class DailyReportGenerator:
         REPORT_DIR.mkdir(parents=True, exist_ok=True)
         path = REPORT_DIR / f"{self.date}_report.md"
         path.write_text(self.generate_markdown(), encoding="utf-8")
+        return path
+
+    def save_with_sector(self, sector_report: str) -> Path:
+        """保存含板块分析的报告"""
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        path = REPORT_DIR / f"{self.date}_report.md"
+        md = self.generate_markdown()
+        # 在重点股票分析前插入板块报告
+        if sector_report:
+            md = md.replace("---\n\n## 重点股票分析", sector_report + "\n---\n\n## 重点股票分析")
+        path.write_text(md, encoding="utf-8")
         return path
