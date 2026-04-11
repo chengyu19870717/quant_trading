@@ -177,21 +177,61 @@ class StockDataCollector:
             "main_net_flow": 0,
         }
 
-        # PE/PB（失败静默跳过）
+        # PE/PB（通过个股信息 + 财务数据计算）
         try:
-            df_val = ak.stock_a_lg_indicator(symbol=code)
-            if df_val is not None and not df_val.empty:
-                r = df_val.iloc[-1]
-                data["pe"] = float(r.get("pe") or 0)
-                data["pb"] = float(r.get("pb") or 0)
+            info = ak.stock_individual_info_em(symbol=code)
+            if info is not None and not info.empty:
+                info_map = dict(zip(info["item"], info["value"]))
+                total_mv = float(info_map.get("总市值") or 0)
+
+                # 从利润表获取净利润并年化
+                try:
+                    df_inc = ak.stock_financial_report_sina(stock=code, symbol="利润表")
+                    if df_inc is not None and not df_inc.empty:
+                        net_income = float(df_inc.iloc[0].get("归属于母公司所有者的净利润") or 0)
+                        # 判断报告期（Q1/Q2/Q3/年报）
+                        report_date = str(df_inc.iloc[0].get("报告日") or "")
+                        if report_date and len(report_date) >= 6:
+                            month = int(report_date[4:6])
+                            # 年化：Q1(3月)×4, Q2(6月)×2, Q3(9月)×4/3, 年报(12月)×1
+                            if month <= 3:
+                                annual_net = net_income * 4
+                            elif month <= 6:
+                                annual_net = net_income * 2
+                            elif month <= 9:
+                                annual_net = net_income * 4 / 3
+                            else:
+                                annual_net = net_income
+                        else:
+                            annual_net = net_income * 4  # 默认年化
+
+                        if annual_net > 0:
+                            data["pe"] = round(total_mv / annual_net, 2)
+                except Exception:
+                    pass
+
+                # PB = 总市值 / 归属于母公司股东权益
+                try:
+                    df_bs = ak.stock_financial_report_sina(stock=code, symbol="资产负债表")
+                    if df_bs is not None and not df_bs.empty:
+                        equity = float(df_bs.iloc[0].get("归属于母公司股东权益合计") or 0)
+                        if equity > 0:
+                            data["pb"] = round(total_mv / equity, 2)
+                except Exception:
+                    pass
         except Exception:
             pass
 
-        # 资金流向（失败静默跳过）
+        # 资金流向 — 取当日数据（而非 iloc[-1] 最新行）
         try:
             df_flow = ak.stock_individual_fund_flow(stock=code, market="sz" if code.startswith(("0","3")) else "sh")
             if df_flow is not None and not df_flow.empty:
-                latest_flow = df_flow.iloc[-1]
+                # 按日期匹配最新交易日
+                latest_date = str(latest["日期"])[:10]
+                flow_rows = df_flow[df_flow["日期"].astype(str) == latest_date]
+                if flow_rows.empty:
+                    flow_rows = df_flow.tail(1)
+                latest_flow = flow_rows.iloc[-1]
                 data["main_net_flow"] = float(latest_flow.get("主力净流入-净额") or 0) / 1e4  # 转万元
         except Exception:
             pass

@@ -84,13 +84,18 @@ class AIStockScorer:
         if ind.get("profit_growth", 0) > 20:
             score += 10
 
-        pe = data.get("pe") or 0
-        pb = data.get("pb") or 0
-        if 0 < pe < 20:
+        pe = data.get("pe")
+        pb = data.get("pb")
+        # PE/PB 缺失时扣分（数据不可信）
+        if pe is None or pe == 0:
+            score -= 15
+        elif 0 < pe < 20:
             score += 10
         elif pe > 100 or pe < 0:
             score -= 10
-        if 0 < pb < 2:
+        if pb is None or pb == 0:
+            score -= 10
+        elif 0 < pb < 2:
             score += 5
 
         return max(0.0, min(100.0, score))

@@ -39,10 +39,15 @@ class ChipAnalyzer:
     @staticmethod
     def _fetch(code: str) -> pd.DataFrame:
         import akshare as ak
-        df = ak.stock_cyq_em(symbol=code, adjust="qfq")
-        if df is None or df.empty:
-            return None
-        return df.tail(WINDOW).reset_index(drop=True)
+        # 尝试东财筹码分布
+        try:
+            df = ak.stock_cyq_em(symbol=code, adjust="qfq")
+            if df is not None and not df.empty and len(df) >= 5:
+                return df.tail(WINDOW).reset_index(drop=True)
+        except Exception:
+            pass
+        # Fallback: 尝试其他接口
+        return None
 
     @staticmethod
     def _compute(df: pd.DataFrame, price: float) -> dict:
