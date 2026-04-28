@@ -62,7 +62,7 @@ class Backtester:
 
             # 取最近 days 个交易日
             test_hist = hist.tail(days + 1).reset_index(drop=True)
-            dates, predictions, actuals = [], [], []
+            dates, predictions, actuals, factor_rows = [], [], [], []
 
             for i in range(1, len(test_hist)):
                 try:
@@ -97,8 +97,9 @@ class Backtester:
                     tmp_data["chip_signals"] = []
                     tmp_data["chip_profit_ratio"] = 50
 
-                    # 评分
+                    # 评分（同时获取各维度细分）
                     prob = AIStockScorer.calculate_probability(tmp_data)
+                    detail = AIStockScorer.get_detailed_scores(tmp_data)
 
                     # 实际涨跌：次日收盘价 vs 当日收盘价
                     if i + 1 < len(test_hist):
@@ -110,6 +111,14 @@ class Backtester:
                     dates.append(str(window.iloc[-1]["日期"])[:10])
                     predictions.append(prob)
                     actuals.append(actual_up)
+                    factor_rows.append({
+                        "tech":      detail.get("tech_score", 50),
+                        "fund":      detail.get("fund_score", 50),
+                        "money":     detail.get("money_score", 50),
+                        "sentiment": detail.get("sentiment_score", 50),
+                        "chip":      detail.get("chip_score", 50),
+                        "actual_up": actual_up,
+                    })
 
                 except Exception:
                     continue
@@ -131,6 +140,19 @@ class Backtester:
             returns = np.diff(np.array(predictions)) / 100
             sharpe = returns.mean() / returns.std() * np.sqrt(252) if len(returns) > 1 and returns.std() > 0 else 0
 
+            # 因子有效性：各维度高分（>60）与低分（<40）时，次日实际上涨率对比
+            factor_effectiveness = {}
+            for factor in ["tech", "fund", "money", "sentiment", "chip"]:
+                high_rows = [r for r in factor_rows if r[factor] > 60]
+                low_rows  = [r for r in factor_rows if r[factor] < 40]
+                high_win  = sum(1 for r in high_rows if r["actual_up"]) / len(high_rows) * 100 if high_rows else None
+                low_win   = sum(1 for r in low_rows  if r["actual_up"]) / len(low_rows)  * 100 if low_rows  else None
+                factor_effectiveness[factor] = {
+                    "high_score_win_rate": round(high_win, 1) if high_win is not None else "-",
+                    "low_score_win_rate":  round(low_win,  1) if low_win  is not None else "-",
+                    "high_n": len(high_rows), "low_n": len(low_rows),
+                }
+
             results[code] = {
                 "name": name,
                 "dates": dates,
@@ -142,6 +164,7 @@ class Backtester:
                 "sharpe": round(sharpe, 2),
                 "avg_prob": round(np.mean(predictions), 1),
                 "prob_std": round(np.std(predictions), 1),
+                "factor_effectiveness": factor_effectiveness,
             }
             log(f"  ✅ {name}: 准确率={accuracy:.1f}% 胜率={win_rate:.1f}% 夏普={sharpe:.2f} 天数={len(actuals)}")
 
@@ -165,6 +188,18 @@ class Backtester:
             print(f"    上涨胜率: {r['win_rate']}%")
             print(f"    夏普比率: {r['sharpe']}")
             print(f"    平均概率: {r['avg_prob']}% (标准差: {r['prob_std']})")
+            fe = r.get("factor_effectiveness", {})
+            if fe:
+                print(f"    {'─' * 50}")
+                print(f"    因子有效性（高分时胜率 vs 低分时胜率）:")
+                for factor, eff in fe.items():
+                    h = f"{eff['high_score_win_rate']}%(n={eff['high_n']})"
+                    l = f"{eff['low_score_win_rate']}%(n={eff['low_n']})"
+                    diff = ""
+                    if isinstance(eff['high_score_win_rate'], float) and isinstance(eff['low_score_win_rate'], float):
+                        delta = eff['high_score_win_rate'] - eff['low_score_win_rate']
+                        diff = f"  差值:{delta:+.1f}%{'✅' if delta > 5 else ('⚠️' if delta < -5 else '')}"
+                    print(f"      {factor:12s}  高>{h:18s} 低>{l:18s}{diff}")
             all_accuracies.append(r['accuracy'])
 
         print(f"\n  {'─' * 60}")

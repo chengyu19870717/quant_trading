@@ -304,7 +304,9 @@ class StockDataCollector:
                             month = int(report_date[4:6]) if len(report_date) >= 6 else 12
                             multiplier = {3: 4, 6: 2, 9: 4/3}.get(month, 1)
                             annual_net = net * multiplier
-                            result["roe"] = round(annual_net / equity * 100, 2)
+                            roe_raw = annual_net / equity * 100
+                            # 季报年化在极端亏损时会放大到异常值，clamp 到合理区间
+                            result["roe"] = round(max(-50.0, min(100.0, roe_raw)), 2)
                 except Exception:
                     pass
         except Exception:

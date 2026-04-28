@@ -451,12 +451,15 @@ class AIStockScorer:
     @classmethod
     def _calc_money_flow_score(cls, data: dict) -> float:
         score = 50
-        main_net   = data.get("main_net_flow", 0)
-        circ_cap   = data.get("circulation_market_cap", 0)
+        main_net = data.get("main_net_flow", 0)   # 万元（3日均值）
+        circ_cap = data.get("circulation_market_cap", 0)  # 亿元
         p = lambda k: cls._p("money_flow", k)
 
         if circ_cap > 0:
-            flow_ratio = main_net / (circ_cap * 10000) * 100
+            # 按市值分档缩放阈值：50亿以下基准，每增大100亿阈值降低40%
+            # 大盘股日均流量绝对值大但相对占比小，避免固定阈值对大盘股永远无效
+            size_scale = max(0.3, min(1.0, 50 / circ_cap)) if circ_cap > 50 else 1.0
+            flow_ratio = main_net / (circ_cap * 10000) * 100 / size_scale
         else:
             flow_ratio = 0
 
@@ -470,6 +473,17 @@ class AIStockScorer:
             score -= p("flow_high_penalty")
         elif flow_ratio < -1:
             score -= p("flow_mid_penalty")
+
+        # OBV 斜率补充：聪明资金持续流入/流出方向确认
+        obv_slope = data.get("obv_slope", 0)
+        if obv_slope > 0.5:
+            score += 8
+        elif obv_slope > 0.2:
+            score += 4
+        elif obv_slope < -0.5:
+            score -= 8
+        elif obv_slope < -0.2:
+            score -= 4
 
         return max(0.0, min(100.0, score))
 

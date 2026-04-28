@@ -13,7 +13,8 @@ class DailyReportGenerator:
     def __init__(self, date: str):
         self.date   = date
         self.stocks = []
-        self.yesterday_verify = None  # 昨日预测验证数据
+        self.yesterday_verify = None
+        self.market_temp_desc = ""     # 市场温度描述
 
     def add_stock(self, stock_data: dict):
         self.stocks.append(stock_data)
@@ -36,6 +37,8 @@ class DailyReportGenerator:
         if self.yesterday_verify:
             report += self._generate_verify_section()
 
+        report += self._generate_ranking(sorted_stocks)
+
         report += """---
 
 ## 重点股票分析
@@ -50,8 +53,8 @@ class DailyReportGenerator:
     def _generate_verify_section(self) -> str:
         """生成昨日预测验证区块"""
         lines = ["## 📈 昨日预测验证\n"]
-        lines.append("| 股票 | 昨日预测上涨概率 | 今日实际涨跌 | 预测结果 |")
-        lines.append("|---|---|---|---|")
+        lines.append("| 股票 | 昨日预测上涨概率 | 今日实际涨跌 | 预测结果 | 止损 |")
+        lines.append("|---|---|---|---|---|")
 
         correct = 0
         total = 0
@@ -66,7 +69,8 @@ class DailyReportGenerator:
             total += 1
             emoji = "✅" if hit else "❌"
             direction = "▲" if actual_up else "▼"
-            lines.append(f"| {v.get('name', '')}({v.get('code', '')}) | {pred:.1f}% | {direction}{abs(actual):.2f}% | {emoji} |")
+            stop_str = f"触发🔴({v.get('stop_loss', 0):.2f})" if v.get("stop_hit") else "未触发"
+            lines.append(f"| {v.get('name', '')}({v.get('code', '')}) | {pred:.1f}% | {direction}{abs(actual):.2f}% | {emoji} | {stop_str} |")
 
         acc = correct / total * 100 if total else 0
         lines.append(f"\n> **近期预测准确率**: {acc:.0f}% ({correct}/{total})")
@@ -171,6 +175,24 @@ class DailyReportGenerator:
 
 ---
 """
+
+    def _generate_ranking(self, stocks: list) -> str:
+        """生成明日上涨概率排行榜，含判断依据"""
+        temp_note = f"  *{self.market_temp_desc}*" if self.market_temp_desc else ""
+        lines = [f"## 📊 明日上涨概率排行{temp_note}\n"]
+        lines.append("| 排名 | 股票 | 概率 | 今日涨跌 | 判断依据 |")
+        lines.append("|------|------|------|---------|---------|")
+        for i, s in enumerate(stocks, 1):
+            prob  = s.get("probability", 50)
+            emoji = "🟢" if prob >= 60 else ("🟡" if prob >= 45 else "🔴")
+            arrow = "▲" if s.get("change_pct", 0) >= 0 else "▼"
+            reason = s.get("reason", "—")
+            lines.append(
+                f"| {i} | **{s['name']}**({s['code']}) | {emoji} **{prob}%** "
+                f"| {arrow}{abs(s.get('change_pct',0)):.2f}% | {reason} |"
+            )
+        lines.append("")
+        return "\n".join(lines)
 
     def _generate_summary(self, stocks: list) -> str:
         top    = [s for s in stocks if s.get("probability", 0) >= 60]

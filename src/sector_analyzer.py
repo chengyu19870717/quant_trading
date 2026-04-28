@@ -49,6 +49,40 @@ class SectorAnalyzer:
         return {"sectors": sectors}
 
     @staticmethod
+    def apply_synergy_bonus(stocks: list, analysis: dict, bonus: float = 3.0) -> list:
+        """
+        板块联动共振：板块内 ≥2/3 标的概率 >60%，板块整体看多，
+        对板块内所有个股额外加 bonus 分（不超过 100）。
+        反之，板块内 ≥2/3 标的概率 <40%，则扣 bonus 分。
+        """
+        sectors = analysis.get("sectors", {})
+        synergy_map: dict[str, float] = {}  # code → delta
+
+        for sec_name, sec in sectors.items():
+            stocks_in = sec.get("stocks", [])
+            if len(stocks_in) < 2:  # 单只股票的板块无共振意义
+                continue
+            bullish = sum(1 for s in stocks_in if s["probability"] > 60)
+            bearish = sum(1 for s in stocks_in if s["probability"] < 40)
+            n = len(stocks_in)
+            if bullish / n >= 2 / 3:
+                for s in stocks_in:
+                    synergy_map[s["code"]] = bonus
+            elif bearish / n >= 2 / 3:
+                for s in stocks_in:
+                    synergy_map[s["code"]] = -bonus
+
+        for stock in stocks:
+            delta = synergy_map.get(stock.get("code", ""), 0)
+            if delta:
+                stock["probability"] = round(
+                    max(0, min(100, stock["probability"] + delta)), 1
+                )
+                stock.setdefault("synergy_bonus", delta)
+
+        return stocks
+
+    @staticmethod
     def generate_report(analysis: dict) -> str:
         """生成板块分析 Markdown 区块"""
         sectors = analysis.get("sectors", {})

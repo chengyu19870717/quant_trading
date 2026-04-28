@@ -71,17 +71,19 @@ class TechnicalIndicators:
         df = TechnicalIndicators.calculate_kdj(df)
         df = TechnicalIndicators.calculate_bollinger_bands(df)
         df = TechnicalIndicators.calculate_volume_ratio(df)
-        df = TechnicalIndicators.calculate_rsi(df)  # [优化] 新增 RSI
-        df = TechnicalIndicators.calculate_momentum(df)  # [优化] 新增 Momentum
+        df = TechnicalIndicators.calculate_rsi(df)
+        df = TechnicalIndicators.calculate_momentum(df)
+        df = TechnicalIndicators.calculate_obv(df)
         data["hist"] = df
 
         # 把最新一行指标写到 data 顶层，方便评分器直接取用
         latest = df.iloc[-1]
+
         for col in ["ma5","ma10","ma20","ma30","ma60",
                     "dif","dea","macd_hist",
                     "kdj_k","kdj_d","kdj_j",
                     "bb_upper","bb_middle","bb_lower",
-                    "vol_ratio","rsi_14","momentum_20d"]:  # 新增两个指标
+                    "vol_ratio","rsi_14","momentum_20d","obv","obv_slope"]:
             if col in df.columns:
                 data[col] = float(latest[col]) if pd.notna(latest[col]) else 0.0
 
@@ -157,12 +159,26 @@ class TechnicalIndicators:
 
     @staticmethod
     def calculate_momentum(df: pd.DataFrame, period: int = 20) -> pd.DataFrame:
-        """
-        [优化 Phase 1] Momentum 动量因子 - 20 日涨幅%
-        公式：(当前收盘 / N天前收盘 - 1) * 100
-        """
         df["momentum_20d"] = (df["收盘"] / df["收盘"].shift(period) - 1) * 100
         df["momentum_20d"] = df["momentum_20d"].fillna(0.0)
+        return df
+
+    @staticmethod
+    def calculate_obv(df: pd.DataFrame) -> pd.DataFrame:
+        """OBV 能量潮：成交量 × 方向（上涨+1/下跌-1）累加。
+        再提取 10 日线性回归斜率（归一化到价格%），判断聪明资金方向。"""
+        direction = np.sign(df["收盘"].diff()).fillna(0)
+        df["obv"] = (direction * df["成交量"]).cumsum()
+
+        # 斜率：10日 OBV 线性趋势 / 成交量均值，归一化为相对值
+        if len(df) >= 10:
+            obv_tail = df["obv"].values[-10:]
+            x = np.arange(10)
+            slope = float(np.polyfit(x, obv_tail, 1)[0])
+            vol_mean = df["成交量"].tail(10).mean()
+            df["obv_slope"] = slope / vol_mean if vol_mean > 0 else 0
+        else:
+            df["obv_slope"] = 0.0
         return df
 
     @staticmethod

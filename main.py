@@ -94,7 +94,8 @@ def load_yesterday_verify(date: str, today_results: list) -> list:
     """
     from datetime import datetime as dt
     try:
-        today_map = {d["code"]: d.get("change_pct", 0) for d in today_results}
+        today_map = {d["code"]: {"change_pct": d.get("change_pct", 0), "low": d.get("low", 0)}
+                     for d in today_results}
         d = dt.strptime(date, "%Y-%m-%d")
         for i in range(1, 5):   # 最多往前找 4 天（应对节假日连休）
             prev_date = (d - timedelta(days=i)).strftime("%Y-%m-%d")
@@ -108,11 +109,19 @@ def load_yesterday_verify(date: str, today_results: list) -> list:
                 code = prev_stock["code"]
                 if code not in today_map:
                     continue
+                today_data   = today_map[code]
+                stop_loss    = prev_stock.get("stop_loss", 0)
+                prev_price   = prev_stock.get("price", 0)
+                today_low    = today_data.get("low", 0)      # 今日最低价
+                stop_hit     = bool(stop_loss and today_low and today_low <= stop_loss)
                 verify.append({
                     "name":          prev_stock.get("name", code),
                     "code":          code,
                     "pred_prob":     prev_stock.get("probability", 50),
-                    "actual_change": today_map[code],   # 今日真实涨跌幅
+                    "actual_change": today_data.get("change_pct", 0),
+                    "stop_loss":     stop_loss,
+                    "stop_hit":      stop_hit,     # 今日是否触发止损
+                    "prev_price":    prev_price,
                 })
             if verify:
                 return verify
@@ -179,11 +188,13 @@ def main():
     verify = load_yesterday_verify(args.date, results)
     if verify:
         reporter.set_yesterday_verify(verify)
-        correct = sum(1 for v in verify if (v["pred_prob"] >= 50) == (v["actual_change"] >= 0))
-        log(f"  昨日验证: {correct}/{len(verify)} 预测正确 ({correct/len(verify)*100:.0f}%)")
+        correct   = sum(1 for v in verify if (v["pred_prob"] >= 50) == (v["actual_change"] >= 0))
+        stop_hits = sum(1 for v in verify if v.get("stop_hit"))
+        log(f"  昨日验证: {correct}/{len(verify)} 预测正确 ({correct/len(verify)*100:.0f}%)  止损触发: {stop_hits}/{len(verify)}")
 
-    # 板块分析
+    # 板块分析 + 联动共振调整
     sector_analysis = SectorAnalyzer.analyze(results)
+    results = SectorAnalyzer.apply_synergy_bonus(results, sector_analysis)
     sector_report = SectorAnalyzer.generate_report(sector_analysis)
 
     # 保存报告（含板块分析）
@@ -234,6 +245,7 @@ def main():
             "bb_middle":       round(d.get("bb_middle", 0), 2),
             "bb_lower":        round(d.get("bb_lower", 0), 2),
             "vol_ratio":       round(d.get("vol_ratio", 0), 2),
+            "obv_slope":       round(d.get("obv_slope", 0), 4),
             "signals":         [s for s in d.get("signals", []) if isinstance(s, str)],
 
             # ── 基本面 ──
@@ -292,6 +304,23 @@ def main():
 
     print("=" * 70)
     print(f"\n完整报告：{report_path}\n")
+
+    # 因子 IC 分析（需要 ≥2 天历史数据；数据不足时静默跳过）
+    try:
+        from src.parameter_optimizer import ParameterOptimizer
+        ic = ParameterOptimizer.compute_factor_ic(LOG_DIR)
+        if ic:
+            suggestions = ParameterOptimizer.suggest_weight_adjustment(ic)
+            print("─" * 70)
+            print("📐 因子有效性分析（IC = 各维度分 vs 次日实际涨跌相关系数）")
+            print("─" * 70)
+            for factor, val in ic.items():
+                sug = suggestions.get(factor, "")
+                print(f"  {factor:12s}  IC={val:+.3f}  {sug}")
+            print("─" * 70)
+            print("  建议：IC 显著为正的因子可在 investment_hub 参数面板提权\n")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
