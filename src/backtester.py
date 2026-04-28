@@ -33,6 +33,19 @@ class Backtester:
         self.stocks = cfg["stocks"]
         self.collector = StockDataCollector()
 
+    def _load_hist_for_backtest(self, code: str, days: int) -> pd.DataFrame:
+        """
+        优先从 hist_daily 本地库读取（支持长周期回测）。
+        若本地无数据，fallback 到 data_collector 实时拉取（仅 60 日）。
+        """
+        from history_downloader import HistoryDownloader
+        hist = HistoryDownloader.load_hist(code)
+        if hist is not None and len(hist) >= days + 20:
+            return hist
+        # fallback：实时拉取（只有 ~60 行，适合短回测）
+        data = self.collector.get_stock_data(code, datetime.now().strftime("%Y-%m-%d"))
+        return data.get("hist")
+
     def run(self, days: int = 60, single_stock: str = None) -> dict:
         """
         回测最近 N 个交易日
@@ -49,18 +62,20 @@ class Backtester:
 
         for code, name in stocks:
             log(f"回测 {name}({code})...")
-            # 获取历史行情（多取 20 天作为缓冲）
             try:
-                data = self.collector.get_stock_data(code, end_date.strftime("%Y-%m-%d"))
-                hist = data["hist"]
-                if hist is None or hist.empty or len(hist) < days + 20:
-                    log(f"  ⚠️ 历史数据不足（{len(hist) if hist is not None else 0} 行），跳过")
-                    continue
+                hist = self._load_hist_for_backtest(code, days)
             except Exception as e:
-                log(f"  ❌ 获取数据失败: {e}")
+                log(f"  ❌ 读取历史数据失败: {e}")
                 continue
 
-            # 取最近 days 个交易日
+            if hist is None or hist.empty:
+                log(f"  ⚠️ 无历史数据，请先在 investment_hub 点击「下载历史数据」")
+                continue
+            if len(hist) < days + 20:
+                log(f"  ⚠️ 数据仅 {len(hist)} 行，需 {days+20} 行，请先下载历史数据")
+                continue
+
+            # 取最近 days 个交易日（+1 用于计算次日涨跌）
             test_hist = hist.tail(days + 1).reset_index(drop=True)
             dates, predictions, actuals, factor_rows = [], [], [], []
 
