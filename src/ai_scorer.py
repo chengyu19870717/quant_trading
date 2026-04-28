@@ -348,6 +348,15 @@ class AIStockScorer:
             strength = min(1.0, (kdj_k - 80) / 20) if kdj_k > 80 else 0
             score -= int(15 * strength)
 
+        # RSI 超卖/超买（与 KDJ 类似，RSI<30 加分，RSI>70 扣分）
+        rsi = data.get("rsi_14", 50)
+        if "RSI_OVERSOLD" in signals:
+            strength = min(1.0, (30 - rsi) / 30) if rsi < 30 else 0
+            score += int(10 * strength)
+        elif "RSI_OVERBOUGHT" in signals:
+            strength = min(1.0, (rsi - 70) / 30) if rsi > 70 else 0
+            score -= int(10 * strength)
+
         # 偏离 MA20 过远扣分
         dist = abs(data.get("distance_from_ma20", 0))
         if dist > 10:
