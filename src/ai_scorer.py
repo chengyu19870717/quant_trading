@@ -363,12 +363,16 @@ class AIStockScorer:
         elif momentum_20d < -10:
             score -= int(15 * momentum_strength)
 
-        # [优化 Phase 2.1] 信号确认加成 - 识别"趋势+反转"强买信号
+        # 信号确认加成：仅在个体信号未饱和时才补充
+        # 避免已高分时加上 +30 全部被 clamp 截掉（等于白计算）
         if signals:
             confirmation = SignalConfirmation.analyze(signals)
-            score += confirmation["confirmation_score"]
-
-            # 记录确认信息到 data，供后续分析使用
+            conf = confirmation["confirmation_score"]
+            if conf > 0:
+                # 正向确认：只能把分数推到 82（留 18 分缓冲给 clamp 边界）
+                conf = min(conf, max(0, 82 - score))
+            # 负向确认（矛盾信号）不限制，让它充分扣分
+            score += conf
             data["signal_confirmation"] = confirmation
 
         return max(0.0, min(100.0, score))

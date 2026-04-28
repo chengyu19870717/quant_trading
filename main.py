@@ -87,29 +87,34 @@ def analyze_stock(collector: StockDataCollector, code: str, name: str, date: str
     return data
 
 
-def load_yesterday_verify(date: str, stocks: list) -> list:
-    """加载昨日预测验证数据"""
+def load_yesterday_verify(date: str, today_results: list) -> list:
+    """
+    加载昨日预测并与今日实际涨跌对比。
+    today_results: 今日已采集完成的 stock data 列表，含 code / change_pct。
+    """
     from datetime import datetime as dt
     try:
+        today_map = {d["code"]: d.get("change_pct", 0) for d in today_results}
         d = dt.strptime(date, "%Y-%m-%d")
-        # 找上一个交易日（简单减去 1-3 天）
-        for i in range(1, 4):
+        for i in range(1, 5):   # 最多往前找 4 天（应对节假日连休）
             prev_date = (d - timedelta(days=i)).strftime("%Y-%m-%d")
             prev_path = LOG_DIR / f"{prev_date.replace('-', '')}_report.json"
-            if prev_path.exists():
-                with open(prev_path, "r", encoding="utf-8") as f:
-                    prev_data = json.load(f)
-                verify = []
-                for s in stocks:
-                    code, name = s
-                    prev_stock = next((p for p in prev_data if p["code"] == code), None)
-                    if prev_stock:
-                        verify.append({
-                            "name": name,
-                            "code": code,
-                            "pred_prob": prev_stock.get("probability", 50),
-                            "actual_change": s[2] if len(s) > 2 else 0,  # 需要传入实际涨跌
-                        })
+            if not prev_path.exists():
+                continue
+            with open(prev_path, "r", encoding="utf-8") as f:
+                prev_data = json.load(f)
+            verify = []
+            for prev_stock in prev_data:
+                code = prev_stock["code"]
+                if code not in today_map:
+                    continue
+                verify.append({
+                    "name":          prev_stock.get("name", code),
+                    "code":          code,
+                    "pred_prob":     prev_stock.get("probability", 50),
+                    "actual_change": today_map[code],   # 今日真实涨跌幅
+                })
+            if verify:
                 return verify
     except Exception:
         pass
@@ -169,6 +174,13 @@ def main():
     if not results:
         log("无有效数据，退出")
         return
+
+    # 昨日预测验证（今日数据采集完成后回填实际涨跌）
+    verify = load_yesterday_verify(args.date, results)
+    if verify:
+        reporter.set_yesterday_verify(verify)
+        correct = sum(1 for v in verify if (v["pred_prob"] >= 50) == (v["actual_change"] >= 0))
+        log(f"  昨日验证: {correct}/{len(verify)} 预测正确 ({correct/len(verify)*100:.0f}%)")
 
     # 板块分析
     sector_analysis = SectorAnalyzer.analyze(results)
