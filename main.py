@@ -44,12 +44,19 @@ def load_watchlist(path: str) -> list:
     return cfg["stocks"]
 
 
-def analyze_stock(collector: StockDataCollector, code: str, name: str, date: str) -> dict:
+def analyze_stock(collector: StockDataCollector, code: str, name: str, date: str,
+                  market_temp: float = 1.0, market_temp_desc: str = "",
+                  mkt: dict = None) -> dict:
     log(f"  采集 {name}({code})...")
 
     # 1. 行情数据
     data = collector.get_stock_data(code, date)
     data["name"] = name
+
+    # 注入市场数据，供 AdaptiveWeights.determine_condition 使用
+    if mkt:
+        data["hs300_change_pct"] = mkt.get("hs300_change", 0)
+        data["north_net_flow"]   = mkt.get("north_flow", 0)   # 亿元
 
     # 2. 技术指标
     data = TechnicalIndicators.calculate_all(data)
@@ -65,8 +72,9 @@ def analyze_stock(collector: StockDataCollector, code: str, name: str, date: str
     data["signals"] = data.get("signals", []) + chip["chip_signals"]
 
     # 5. AI 评分
-    data["probability"] = AIStockScorer.calculate_probability(data)
+    data["probability"] = AIStockScorer.calculate_probability(data, market_temp)
     data.update(AIStockScorer.get_detailed_scores(data))
+    data["reason"] = AIStockScorer.generate_reason(data, market_temp_desc)
 
     # 6. 风控建议
     data["risk"] = RiskControl.get_advice(data, data["probability"])
@@ -139,9 +147,18 @@ def main():
     reporter  = DailyReportGenerator(args.date)
     results   = []
 
+    # 拉取市场温度（统一拉一次，注入每只股票分析）
+    log("拉取市场温度...")
+    mkt = collector.get_market_temperature()
+    log(f"  市场温度: {mkt['temp_desc']} | 系数={mkt['temperature']} | 北向={mkt['north_flow']:.1f}亿")
+    reporter.market_temp_desc = mkt["temp_desc"]
+
     for code, name in stocks:
         try:
-            data = analyze_stock(collector, code, name, args.date)
+            data = analyze_stock(collector, code, name, args.date,
+                                 market_temp=mkt["temperature"],
+                                 market_temp_desc=mkt["temp_desc"],
+                                 mkt=mkt)
             reporter.add_stock(data)
             results.append(data)
             risk = data.get("risk", {})
@@ -161,29 +178,97 @@ def main():
     report_path = reporter.save_with_sector(sector_report)
     log(f"报告已保存: {report_path}")
 
-    # 保存 JSON 数据（供次日验证用）
+    # 保存 JSON 数据（供 investment_hub 展示用）
     json_path = LOG_DIR / f"{args.date.replace('-', '')}_report.json"
     json_data = []
     for d in results:
+        risk = d.get("risk", {})
+        ind  = d.get("indicators", {})
         json_data.append({
-            "code": d["code"],
-            "name": d["name"],
-            "probability": d["probability"],
-            "price": d["price"],
-            "change_pct": d.get("change_pct", 0),
+            # ── 基本信息 ──
+            "code":            d["code"],
+            "name":            d["name"],
+            "date":            args.date,
+            "market_temp":     mkt.get("temp_desc", ""),
+            "sector":          d.get("sector", ""),
+            "concepts":        d.get("concepts", [])[:3],
+
+            # ── 行情 ──
+            "price":           round(d.get("price", 0), 2),
+            "open":            round(d.get("open", 0), 2),
+            "high":            round(d.get("high", 0), 2),
+            "low":             round(d.get("low", 0), 2),
+            "change_pct":      round(d.get("change_pct", 0), 2),
+            "volume":          round(d.get("volume", 0), 0),
+            "turnover_rate":   round(d.get("turnover_rate", 0), 2),
+            "amplitude":       round(d.get("amplitude", 0), 2),
+            "main_net_flow":   round(d.get("main_net_flow", 0), 0),
+            "float_mv":        round(d.get("float_mv", 0) / 1e8, 2),  # 亿
+
+            # ── 技术指标 ──
+            "ma5":             round(d.get("ma5",  0), 2),
+            "ma10":            round(d.get("ma10", 0), 2),
+            "ma20":            round(d.get("ma20", 0), 2),
+            "ma30":            round(d.get("ma30", 0), 2),
+            "ma60":            round(d.get("ma60", 0), 2),
+            "distance_from_ma20": round(d.get("distance_from_ma20", 0), 2),
+            "dif":             round(d.get("dif",  0), 4),
+            "dea":             round(d.get("dea",  0), 4),
+            "macd_hist":       round(d.get("macd_hist", 0), 4),
+            "kdj_k":           round(d.get("kdj_k", 0), 1),
+            "kdj_d":           round(d.get("kdj_d", 0), 1),
+            "kdj_j":           round(d.get("kdj_j", 0), 1),
+            "bb_upper":        round(d.get("bb_upper", 0), 2),
+            "bb_middle":       round(d.get("bb_middle", 0), 2),
+            "bb_lower":        round(d.get("bb_lower", 0), 2),
+            "vol_ratio":       round(d.get("vol_ratio", 0), 2),
+            "signals":         [s for s in d.get("signals", []) if isinstance(s, str)],
+
+            # ── 基本面 ──
+            # pe/pb 优先取行情数据（ind 里的来自利润表，可能为 0）
+            "pe":              round((ind.get("pe") or d.get("pe")) or 0, 1),
+            "pb":              round((ind.get("pb") or d.get("pb")) or 0, 2),
+            # roe 需要资产负债表，当前版本未采集，保留字段但值为 0 表示未获取
+            "roe":             round(ind.get("roe", 0) or 0, 1),
+            "gross_margin":    round(ind.get("gross_margin", 0) or 0, 1),
+            "net_margin":      round(ind.get("net_margin", 0) or 0, 1),
+            "revenue_growth":  round(ind.get("revenue_growth", 0) or 0, 1),
+            "profit_growth":   round(ind.get("profit_growth", 0) or 0, 1),
+
+            # ── 筹码（修正 key 名与 chip_analyzer 输出一致）──
+            "chip_width":      round(d.get("chip_width_70", 0), 2),
+            "low_profit_ratio": round(d.get("chip_profit_ratio", 0), 1),
+            "converging_trend": d.get("chip_is_converging", False),
+
+            # ── AI 评分 ──
+            "probability":     round(d["probability"], 1),
+            "tech_score":      round(d.get("tech_score",  0), 1),
+            "fund_score":      round(d.get("fund_score",  0), 1),
+            "money_score":     round(d.get("money_score", 0), 1),
+            "sentiment_score": round(d.get("sentiment_score", 0), 1),
+            "chip_score":      round(d.get("chip_score",  0), 1),
+            "reason":          d.get("reason", ""),
+
+            # ── 风控 ──
+            "risk_label":      risk.get("risk_label", ""),
+            "risk_advice":     risk.get("advice", ""),
+            "max_position":    risk.get("max_position", 0),
+            "stop_loss":       round(risk.get("stop_loss", 0), 2),
+            "take_profit":     round(risk.get("take_profit", 0), 2),
         })
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(json_data, f, ensure_ascii=False, indent=2)
 
     # 控制台排行
     print("\n" + "=" * 70)
-    print(f"📊 明日上涨概率排行  [{args.date}]")
+    print(f"📊 明日上涨概率排行  [{args.date}]  {mkt['temp_desc']}")
     print("=" * 70)
     for i, d in enumerate(sorted(results, key=lambda x: x["probability"], reverse=True), 1):
         bar   = "█" * int(d["probability"] / 10) + "░" * (10 - int(d["probability"] / 10))
         emoji = "🟢" if d["probability"] >= 60 else ("🟡" if d["probability"] >= 45 else "🔴")
         risk_label = d.get("risk", {}).get("risk_label", "")
-        print(f"{i}. {d['name']:8s} {bar} {d['probability']:5.1f}%  {emoji}  [{risk_label}]  信号:{','.join(d['signals']) or '—'}")
+        print(f"{i}. {d['name']:8s} {bar} {d['probability']:5.1f}%  {emoji}  [{risk_label}]")
+        print(f"   └ {d.get('reason', '—')}")
 
     # 板块排行
     if sector_analysis.get("sectors"):

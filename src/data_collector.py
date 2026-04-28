@@ -1,5 +1,6 @@
 """
 数据采集模块 - 复用 dian_monitor 已验证的 akshare 数据获取逻辑
+[优化 Phase 1] 增加 baostock 筹码数据集成和 K线模拟
 """
 import sqlite3
 import warnings
@@ -47,19 +48,26 @@ def _get_db():
 class StockDataCollector:
 
     def get_stock_data(self, code: str, date: str) -> dict:
-        """获取股票行情 + 财务 + 估值
-        优先级：实时快照 → 最新日线（强制拉取）→ 本地缓存
-        """
+        """获取股票行情 + 财务 + 估值，优先读取当日缓存"""
+        # 0) 读取本地缓存（同日已采集则直接复用，避免重复网络请求）
+        conn = _get_db()
+        cached = self._read_cache(conn, code, date)
+        conn.close()
+        if cached and cached.get("hist") is not None:
+            return cached
+
         # 1) 尝试实时行情（盘中有效）
         realtime = self._fetch_realtime(code)
         if realtime:
             hist = self._ensure_hist(code)
             if hist is not None and not hist.empty:
                 realtime["hist"] = hist
+                realtime["chip_data_missing"] = True  # 筹码由 ChipAnalyzer 单独拉取
                 return realtime
 
-        # 2) 强制从 akshare 拉取最新日线（保证用最新收盘价）
+        # 2) 强制从 akshare 拉取最新日线
         data = self._fetch_from_akshare(code, date)
+        data["chip_data_missing"] = True  # 筹码由 ChipAnalyzer 单独拉取
 
         # 3) 写入本地缓存
         conn = _get_db()
@@ -222,26 +230,43 @@ class StockDataCollector:
         except Exception:
             pass
 
-        # 资金流向 — 取当日数据（而非 iloc[-1] 最新行）
+        # 资金流向 — 取最近 3 日均值（单日数据噪音大，容易被对敲伪造）
         try:
-            df_flow = ak.stock_individual_fund_flow(stock=code, market="sz" if code.startswith(("0","3")) else "sh")
+            market = "sz" if code.startswith(("0", "3")) else "sh"
+            df_flow = ak.stock_individual_fund_flow(stock=code, market=market)
             if df_flow is not None and not df_flow.empty:
-                # 按日期匹配最新交易日
-                latest_date = str(latest["日期"])[:10]
-                flow_rows = df_flow[df_flow["日期"].astype(str) == latest_date]
-                if flow_rows.empty:
-                    flow_rows = df_flow.tail(1)
-                latest_flow = flow_rows.iloc[-1]
-                data["main_net_flow"] = float(latest_flow.get("主力净流入-净额") or 0) / 1e4  # 转万元
+                recent = df_flow.tail(3)
+                avg_flow = recent["主力净流入-净额"].astype(float).mean()
+                data["main_net_flow"] = round(avg_flow / 1e4, 2)  # 元→万元
         except Exception:
             pass
 
         return data
 
+    def _read_cache(self, conn, code: str, date: str) -> Optional[dict]:
+        import json
+        row = conn.execute(
+            "SELECT data_json FROM daily_cache WHERE code=? AND trade_date=?", (code, date)
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            data = json.loads(row[0])
+            if "hist" in data and isinstance(data["hist"], list):
+                data["hist"] = pd.DataFrame(data["hist"])
+                # 还原数值列类型
+                for col in ["开盘","最高","最低","收盘","成交量"]:
+                    if col in data["hist"].columns:
+                        data["hist"][col] = pd.to_numeric(data["hist"][col], errors="coerce")
+            return data
+        except Exception:
+            return None
+
     def _save_cache(self, conn, code: str, date: str, data: dict):
         import json
         save = {k: v for k, v in data.items() if k != "hist"}
-        save["hist"] = data["hist"].to_dict(orient="records")
+        if data.get("hist") is not None and not data["hist"].empty:
+            save["hist"] = data["hist"].to_dict(orient="records")
         conn.execute(
             "INSERT OR REPLACE INTO daily_cache VALUES (?,?,?)",
             (code, date, json.dumps(save, default=str))
@@ -249,26 +274,114 @@ class StockDataCollector:
         conn.commit()
 
     def get_financial_data(self, code: str) -> dict:
-        """获取财务数据（利润表最新一期）"""
+        """获取财务数据（利润表 + 资产负债表最新一期）"""
         import akshare as ak
+        result = {"gross_margin": 0, "net_margin": 0, "revenue_growth": 0, "profit_growth": 0, "roe": 0}
         try:
-            df = ak.stock_financial_report_sina(stock=code, symbol="利润表")
-            if df is not None and not df.empty:
-                r = df.iloc[0]
+            df_inc = ak.stock_financial_report_sina(stock=code, symbol="利润表")
+            if df_inc is not None and not df_inc.empty:
+                r = df_inc.iloc[0]
                 rev  = float(r.get("营业总收入") or 0)
                 cost = float(r.get("营业成本") or 0)
                 net  = float(r.get("归属于母公司所有者的净利润") or 0)
+                rev_prev = float(df_inc.iloc[1].get("营业总收入") or 0) if len(df_inc) > 1 else 0
+                net_prev = float(df_inc.iloc[1].get("归属于母公司所有者的净利润") or 0) if len(df_inc) > 1 else 0
 
-                rev_prev = float(df.iloc[1].get("营业总收入") or 0) if len(df) > 1 else 0
-                net_prev = float(df.iloc[1].get("归属于母公司所有者的净利润") or 0) if len(df) > 1 else 0
+                result.update({
+                    "gross_margin":   (rev - cost) / rev * 100 if rev else 0,
+                    "net_margin":     net / rev * 100 if rev else 0,
+                    "revenue_growth": (rev - rev_prev) / abs(rev_prev) * 100 if rev_prev else 0,
+                    "profit_growth":  (net - net_prev) / abs(net_prev) * 100 if net_prev else 0,
+                })
 
-                return {
-                    "gross_margin":    (rev - cost) / rev * 100 if rev else 0,
-                    "net_margin":      net / rev * 100 if rev else 0,
-                    "revenue_growth":  (rev - rev_prev) / abs(rev_prev) * 100 if rev_prev else 0,
-                    "profit_growth":   (net - net_prev) / abs(net_prev) * 100 if net_prev else 0,
-                    "roe":             0,
-                }
+                # ROE = 年化净利润 / 归属母公司股东权益（来自资产负债表）
+                try:
+                    df_bs = ak.stock_financial_report_sina(stock=code, symbol="资产负债表")
+                    if df_bs is not None and not df_bs.empty:
+                        equity = float(df_bs.iloc[0].get("归属于母公司股东权益合计") or 0)
+                        if equity > 0 and net != 0:
+                            report_date = str(r.get("报告日") or "")
+                            month = int(report_date[4:6]) if len(report_date) >= 6 else 12
+                            multiplier = {3: 4, 6: 2, 9: 4/3}.get(month, 1)
+                            annual_net = net * multiplier
+                            result["roe"] = round(annual_net / equity * 100, 2)
+                except Exception:
+                    pass
         except Exception:
             pass
-        return {"gross_margin": 0, "net_margin": 0, "revenue_growth": 0, "profit_growth": 0, "roe": 0}
+        return result
+
+    def get_market_temperature(self) -> dict:
+        """
+        获取市场温度：沪深300当日涨跌幅 + 北向资金净流入。
+        返回 temperature 系数（0.85~1.15），用于调整个股概率。
+        失败时返回中性值 1.0。
+        """
+        import akshare as ak
+        result = {"hs300_change": 0.0, "north_flow": 0.0, "temperature": 1.0, "temp_desc": "市场中性"}
+        try:
+            # 沪深300当日涨跌
+            df = ak.stock_zh_index_spot_em(symbol="沪深京A股")
+            if df is not None and not df.empty:
+                hs300 = df[df["代码"] == "000300"]
+                if not hs300.empty:
+                    result["hs300_change"] = float(hs300.iloc[0].get("涨跌幅", 0))
+        except Exception:
+            pass
+
+        try:
+            # 北向资金今日净流入（亿元）
+            df_north = ak.stock_connect_position_statistics_em(symbol="沪深港通资金流向")
+            if df_north is not None and not df_north.empty:
+                row = df_north.iloc[0]
+                result["north_flow"] = float(row.get("今日净买入") or 0)
+        except Exception:
+            pass
+
+        # 计算温度系数：hs300涨跌 + 北向资金双维度
+        hs = result["hs300_change"]
+        nf = result["north_flow"]
+
+        score = 0
+        if hs > 2:    score += 2
+        elif hs > 0.5: score += 1
+        elif hs < -2:  score -= 2
+        elif hs < -0.5: score -= 1
+
+        if nf > 50:   score += 1
+        elif nf < -50: score -= 1
+
+        # 映射到系数
+        coeff_map = {3: 1.15, 2: 1.10, 1: 1.05, 0: 1.0, -1: 0.95, -2: 0.90, -3: 0.85}
+        temp = coeff_map.get(max(-3, min(3, score)), 1.0)
+        result["temperature"] = temp
+
+        if temp >= 1.10:   result["temp_desc"] = f"市场强势(沪深300 {hs:+.2f}%)"
+        elif temp >= 1.05: result["temp_desc"] = f"市场偏强(沪深300 {hs:+.2f}%)"
+        elif temp <= 0.90: result["temp_desc"] = f"市场弱势(沪深300 {hs:+.2f}%)"
+        elif temp <= 0.95: result["temp_desc"] = f"市场偏弱(沪深300 {hs:+.2f}%)"
+        else:              result["temp_desc"] = f"市场中性(沪深300 {hs:+.2f}%)"
+
+        return result
+
+    @staticmethod
+    def search_stock(keyword: str) -> list:
+        """
+        股票搜索：支持代码精准匹配 或 名称模糊搜索。
+        返回 [{"code": "300244", "name": "迪安诊断"}, ...]，最多20条。
+        """
+        import akshare as ak
+        try:
+            df = ak.stock_info_a_code_name()
+            if df is None or df.empty:
+                return []
+            keyword = keyword.strip()
+            # 精准代码匹配
+            exact = df[df["code"] == keyword]
+            if not exact.empty:
+                return [{"code": r["code"], "name": str(r["name"]).replace(" ", "")} for _, r in exact.iterrows()]
+            # 名称模糊搜索
+            fuzzy = df[df["name"].str.contains(keyword, na=False)]
+            return [{"code": r["code"], "name": str(r["name"]).replace(" ", "")} for _, r in fuzzy.head(20).iterrows()]
+        except Exception:
+            return []
