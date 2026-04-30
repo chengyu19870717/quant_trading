@@ -92,25 +92,22 @@ class Backtester:
                     tmp_data = TechnicalIndicators.calculate_all(tmp_data)
                     tmp_data["signals"] = TechnicalIndicators.get_trend_signal(tmp_data)
 
-                    # 简化基本面（历史回测中不重复请求财务数据）
+                    # 注意：本回测仅覆盖技术面 + 情绪面，基本面/资金面/筹码使用中性占位值
+                    # 历史财务数据未接入数据库，以下数值不参与因子有效性评估
                     tmp_data["indicators"] = {
                         "gross_margin": 20, "net_margin": 10, "roe": 8,
                         "revenue_growth": 10, "profit_growth": 10,
                     }
                     tmp_data["pe"] = None
                     tmp_data["pb"] = None
-
-                    # 简化资金流向
                     tmp_data["main_net_flow"] = 0
                     tmp_data["circulation_market_cap"] = 0
-
-                    # 简化情绪面
-                    tmp_data["turnover_rate"] = float(window.iloc[-1].get("换手率", 0)) * 100
-                    tmp_data["vol_ratio"] = float(window.iloc[-1].get("vol_ratio", 1))
-
-                    # 简化筹码
                     tmp_data["chip_signals"] = []
                     tmp_data["chip_profit_ratio"] = 50
+
+                    # 情绪面（可从历史 K 线还原）
+                    tmp_data["turnover_rate"] = float(window.iloc[-1].get("换手率", 0)) * 100
+                    tmp_data["vol_ratio"] = float(window.iloc[-1].get("vol_ratio", 1))
 
                     # 评分（同时获取各维度细分）
                     prob = AIStockScorer.calculate_probability(tmp_data)

@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent))
 
 from data_collector import StockDataCollector
 from indicators import TechnicalIndicators
@@ -26,7 +27,111 @@ from risk_control import RiskControl
 from sector_analyzer import SectorAnalyzer, SECTOR_MAP
 
 
-LOG_DIR = Path(__file__).parent / "reports"
+LOG_DIR       = Path(__file__).parent / "reports"
+CUSTOM_MODELS = {}   # 启动时加载，avoid 每只股票重复读文件
+
+
+def _load_custom_models() -> dict:
+    p = Path(__file__).parent / "config" / "custom_models.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _score_with_custom_model(code: str, model: dict) -> float | None:
+    """
+    用专属模型（线性/XGBoost）计算明日上涨概率（返回 0~100，None 表示失败）。
+    复用 backtest_web.py 的特征管道。
+    """
+    try:
+        import sqlite3
+        import numpy as np
+        import pandas as pd
+        from backtest_web import (
+            calc_base_indicators, add_rolling_zscore, add_cross_features,
+            _fetch_index_df, _fetch_flow_df,
+        )
+
+        db = Path(__file__).parent / "data" / "hist_daily.db"
+        if not db.exists():
+            return None
+
+        conn = sqlite3.connect(str(db))
+        df_raw = pd.read_sql_query(
+            "SELECT date,open,high,low,close,volume FROM hist_daily "
+            "WHERE code=? ORDER BY date",
+            conn, params=(code,)
+        )
+        conn.close()
+
+        if len(df_raw) < 80:
+            return None
+
+        df_raw["date"] = pd.to_datetime(df_raw["date"])
+        zscore_win = model.get("zscore_win", 60)
+        mtype      = model.get("model_type", "linear")
+
+        df = calc_base_indicators(df_raw)
+        base = ["body","hl_range","candle_q","gap","macd_hist","kdj_j",
+                "bb_pos","rsi","vol_ratio","vol_accel","bb_squeeze",
+                "ret1","ret3","ret5","ma5_slope","dist_ma5","dist_ma20",
+                "vol_slope","pos_in_range"]
+        df = add_rolling_zscore(df, base, win=zscore_win)
+        df = add_cross_features(df, win=zscore_win)
+
+        features = model.get("features", [])
+
+        # 相对强度特征
+        if "rel_str_z" in features:
+            idx_df = _fetch_index_df()
+            if not idx_df.empty:
+                df = df.merge(idx_df, on="date", how="left")
+                df["rel_str"]    = df["change_pct"] - df["index_ret"].fillna(0)
+                df["rel_str_5d"] = df["rel_str"].rolling(5).mean()
+                df = add_rolling_zscore(df, ["rel_str","rel_str_5d"], win=zscore_win)
+            else:
+                df["rel_str_z"] = 0.0; df["rel_str_5d_z"] = 0.0
+
+        # 资金流特征
+        if "main_pct_z" in features:
+            flow_df = _fetch_flow_df(code)
+            if not flow_df.empty:
+                df = df.merge(flow_df, on="date", how="left")
+                df["main_pct"] = df["main_pct"].fillna(0)
+                df["big_pct"]  = df["big_pct"].fillna(0)
+                df = add_rolling_zscore(df, ["main_pct","big_pct"], win=zscore_win)
+            else:
+                df["main_pct_z"] = 0.0; df["big_pct_z"] = 0.0
+
+        df = df.dropna(subset=features).reset_index(drop=True)
+        if df.empty:
+            return None
+
+        last_row = df.iloc[[-1]][features]
+
+        if mtype == "xgboost":
+            import xgboost as xgb
+            model_path = model.get("model_path", "")
+            if not model_path or not Path(model_path).exists():
+                return None
+            xgb_model = xgb.XGBClassifier()
+            xgb_model.load_model(model_path)
+            prob = float(xgb_model.predict_proba(last_row.values)[0][1])
+            # XGBoost 输出已是 0~1 概率，直接映射到 30~78
+            return round(30.0 + prob * 48.0, 1)
+        else:
+            weights = np.array(model["weights"], dtype=float)
+            # 用全历史得分分位数做归一化，再映射到 30~78
+            all_scores = (df[features].values @ weights).flatten()
+            score_now  = float(last_row.values @ weights)
+            pct_rank   = float((all_scores < score_now).mean())  # 0~1 历史分位
+            return round(30.0 + pct_rank * 48.0, 1)
+
+    except Exception as e:
+        return None
 
 
 def log(msg: str):
@@ -71,10 +176,25 @@ def analyze_stock(collector: StockDataCollector, code: str, name: str, date: str
     data.update(chip)
     data["signals"] = data.get("signals", []) + chip["chip_signals"]
 
-    # 5. AI 评分
-    data["probability"] = AIStockScorer.calculate_probability(data, market_temp)
-    data.update(AIStockScorer.get_detailed_scores(data))
-    data["reason"] = AIStockScorer.generate_reason(data, market_temp_desc)
+    # 5. AI 评分（优先使用专属模型，无专属模型时退回旧版5因子）
+    custom_prob = None
+    if code in CUSTOM_MODELS:
+        custom_prob = _score_with_custom_model(code, CUSTOM_MODELS[code])
+
+    if custom_prob is not None:
+        data["probability"]   = custom_prob
+        data["model_source"]  = CUSTOM_MODELS[code].get("name", "专属模型")
+        # 仍然计算详细评分（用于报告展示），但以专属模型概率为准
+        data.update(AIStockScorer.get_detailed_scores(data))
+        data["reason"] = (
+            f"[{data['model_source']}] " +
+            AIStockScorer.generate_reason(data, market_temp_desc)
+        )
+    else:
+        data["probability"]  = AIStockScorer.calculate_probability(data, market_temp)
+        data["model_source"] = "内置5因子"
+        data.update(AIStockScorer.get_detailed_scores(data))
+        data["reason"] = AIStockScorer.generate_reason(data, market_temp_desc)
 
     # 6. 风控建议
     data["risk"] = RiskControl.get_advice(data, data["probability"])
@@ -150,6 +270,13 @@ def main():
         return
 
     log(f"===== 量化框架启动 | {args.date} =====")
+
+    global CUSTOM_MODELS
+    CUSTOM_MODELS = _load_custom_models()
+    if CUSTOM_MODELS:
+        log(f"  专属模型已加载：{list(CUSTOM_MODELS.keys())} ({len(CUSTOM_MODELS)} 只)")
+    else:
+        log("  未找到专属模型，全部使用内置5因子评分")
 
     stocks = load_watchlist(args.watchlist)
     if args.stock:

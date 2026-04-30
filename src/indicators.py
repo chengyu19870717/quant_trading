@@ -31,7 +31,7 @@ class SignalStrength:
         distance = abs(dif - dea)
         strength = min(1.0, distance / 0.5)
 
-        if dif_pre is not None and dif_pre is not None and dif > dif_pre:
+        if dif_pre is not None and dea_pre is not None and dif > dif_pre:
             strength = strength * 1.2
 
         return min(1.0, strength)
